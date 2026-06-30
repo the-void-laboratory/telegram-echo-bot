@@ -1,30 +1,134 @@
+// name=index.js
 import { Telegraf, Markup } from 'telegraf';
 import http from 'http';
+import fetch from 'node-fetch'; // if your environment doesn't include fetch, install node-fetch
 
-// ==========================================
-// CONFIGURATION
-// ==========================================
-const BOT_TOKEN = '8842774625:AAHKbtnsqHjmyuMySVBW6hz9o716JOi4_qw';
+// IMPORTANT: Use environment variable for bot token
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN environment variable. Set BOT_TOKEN before launching the bot.');
+  process.exit(1);
+}
 
 const bot = new Telegraf(BOT_TOKEN);
 
 // Utility string filter to sanitize text against UI presentation breaks
-const escapeHTML = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const escapeHTML = (str) => String(str)
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;');
 
-// 1. Core Bot Initiation Execution Channel
+// Allowed inline HTML tags per Telegram subset (keep this conservative)
+const ALLOWED_HTML_TAGS = [
+  'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'tg-spoiler', 'code', 'pre', 'a'
+];
+
+// Lightweight validator for Telegram-style HTML: checks allowed tags and basic balancing
+function validateTelegramHTML(input) {
+  const tagRegex = /<\/?([a-zA-Z0-9-]+)(?:\s+[^>]*)?>/g;
+  const stack = [];
+  let match;
+
+  while ((match = tagRegex.exec(input)) !== null) {
+    const full = match[0];
+    const tag = match[1];
+    const isClosing = /^<\//.test(full);
+
+    if (!ALLOWED_HTML_TAGS.includes(tag)) {
+      return { ok: false, error: `Unsupported HTML tag: <${tag}>` };
+    }
+
+    if (isClosing) {
+      if (stack.length === 0 || stack[stack.length - 1] !== tag) {
+        return { ok: false, error: `Mismatched or unexpected closing tag: </${tag}>` };
+      }
+      stack.pop();
+    } else {
+      // treat <br> as no-op
+      if (/^<br\s*\/?>$/i.test(full)) continue;
+      stack.push(tag);
+    }
+  }
+
+  if (stack.length !== 0) {
+    return { ok: false, error: `Unclosed tag: <${stack[stack.length - 1]}>` };
+  }
+
+  return { ok: true };
+}
+
+// Basic Markdown-ish validator to catch unbalanced *, _, and backticks
+function validateSimpleMarkdown(input) {
+  const counts = {
+    '*': (input.match(/\*/g) || []).length,
+    '_': (input.match(/_/g) || []).length,
+    '`': (input.match(/`/g) || []).length,
+  };
+
+  if (counts['*'] % 2 !== 0) return { ok: false, error: "Unbalanced '*' characters (bold/italic)." };
+  if (counts['_'] % 2 !== 0) return { ok: false, error: "Unbalanced '_' characters (italic)." };
+  if (counts['`'] % 2 !== 0) return { ok: false, error: "Unbalanced '`' characters (inline/pre code)." };
+
+  return { ok: true };
+}
+
+// Minimal example InputRichMessage to use as a test payload
+const SAMPLE_RICH_MESSAGE = {
+  blocks: [
+    { type: 'heading', level: 1, text: { text: 'Example' } },
+    { type: 'paragraph', text: { text: 'Hello — this is a rich message test.' } }
+  ]
+};
+
+// Helper to call Telegram sendRichMessage with robust logging and a fallback raw request
+async function safeSendRichMessage(ctx, richMessage) {
+  try {
+    // Primary: use Telegraf's callApi
+    return await ctx.telegram.callApi('sendRichMessage', {
+      chat_id: ctx.chat.id,
+      rich_message: richMessage
+    });
+  } catch (err) {
+    // log full error for debugging
+    console.error('callApi sendRichMessage error:', err && err.response ? err.response : err);
+
+    // If Telegram says unknown method or the library can't call it, try a raw HTTP POST to the Bot API
+    // This helps differentiate "method not available" vs "payload invalid"
+    try {
+      const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendRichMessage`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: ctx.chat.id, rich_message: richMessage })
+      });
+      const body = await res.json();
+      if (!res.ok || !body || body.ok === false) {
+        const info = body && body.description ? `${body.description} (${JSON.stringify(body)})` : JSON.stringify(body);
+        const e = new Error(`Telegram API raw POST failed: ${info}`);
+        e.telegram = body;
+        throw e;
+      }
+      return body;
+    } catch (rawErr) {
+      // Surface the most useful messages back to the user
+      console.error('Raw POST sendRichMessage error:', rawErr && rawErr.telegram ? rawErr.telegram : rawErr);
+      throw rawErr;
+    }
+  }
+}
+
+// Bot handlers
 bot.start((ctx) => {
   const firstName = ctx.from.first_name || 'Developer';
-  
-  // Dynamically points to your Render instance web interface
   const miniAppUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost:3000'}/`;
-  
+
   ctx.reply(
     `🛠️ <b>Telegram Rich Message & Layout Engine Playground</b>\n\n` +
-    `Hello <b>${firstName}</b>! Use this environment canvas to dry-run and stress-test your layout rendering outputs against the native Telegram Bot API rules.\n\n` +
+    `Hello <b>${escapeHTML(firstName)}</b>! Use this environment canvas to dry-run and stress-test your layout rendering outputs against the native Telegram Bot API rules.\n\n` +
     `🔹 <b>Validation Rules:</b>\n` +
     `• <b>HTML Engine:</b> Send native code patterns (e.g., <code>&lt;tg-spoiler&gt;text&lt;/tg-spoiler&gt;</code>).\n` +
     `• <b>Markdown Engine:</b> Send raw typography flags (e.g., <code>*bold text*</code>).\n` +
-    `• <b>Rich Structural JSON:</b> Wrap your payload parameters inside standard brackets <code>{ ... }</code> to use the <code>sendRichMessage</code> API endpoint (for tables, headers, lists, math, and layout blocks).\n\n` +
+    `• <b>Rich Structural JSON:</b> Wrap your payload parameters inside standard brackets <code>{ ... }</code> to use the <code>sendRichMessage</code> API endpoint (for tables, headers, lists).\n` +
     `👇 Click the layout button below to inspect the interactive structural specifications map directly inside Telegram!`,
     {
       parse_mode: 'HTML',
@@ -35,148 +139,105 @@ bot.start((ctx) => {
   );
 });
 
-// 2. Formatting Interpretation Pipeline
 bot.on('message', async (ctx) => {
   if (!ctx.message || !ctx.message.text) return;
   if (ctx.message.text.startsWith('/')) return;
 
   const rawInput = ctx.message.text.trim();
 
-  // Route 1: Intercept Structural JSON formatting layers bound for sendRichMessage
+  // Route 1: JSON -> sendRichMessage
   if (rawInput.startsWith('{') && rawInput.endsWith('}')) {
     try {
       const parsedPayload = JSON.parse(rawInput);
-      
-      // Call Telegram's direct Rich Message method structure natively
-      await ctx.telegram.callApi('sendRichMessage', {
-        chat_id: ctx.chat.id,
-        rich_message: parsedPayload
-      });
+
+      // prefer an object with `blocks`
+      const richMessage = parsedPayload.blocks ? parsedPayload : (Array.isArray(parsedPayload) ? { blocks: parsedPayload } : { blocks: [parsedPayload] });
+
+      // quick structural check
+      if (!richMessage.blocks || !Array.isArray(richMessage.blocks) || richMessage.blocks.length === 0) {
+        throw new Error('rich_message.blocks must be a non-empty array.');
+      }
+
+      await safeSendRichMessage(ctx, richMessage);
       return;
-    } catch (richError) {
+    } catch (err) {
+      console.error('sendRichMessage error to user:', err && err.telegram ? err.telegram : err.message || err);
       await ctx.reply(
-        `❌ <b>sendRichMessage JSON Compilation Failed</b>\n\n` +
-        `🚨 <b>Error Vector:</b> <code>${escapeHTML(richError.message)}</code>\n\n` +
-        `💡 <i>Check:</i> Make sure your structure correctly binds properties to the <code>InputRichMessage</code> schema layer inside a valid array stack.`,
+        `❌ <b>sendRichMessage Failed</b>\n\n` +
+        `🚨 <b>Error:</b> <code>${escapeHTML(err && err.telegram && err.telegram.description ? err.telegram.description : (err.message || String(err)))}</code>\n\n` +
+        `💡 <i>Tip:</i> Ensure your JSON matches the InputRichMessage schema (top-level object with a \"blocks\" array). Example: ${escapeHTML(JSON.stringify(SAMPLE_RICH_MESSAGE))}`,
         { parse_mode: 'HTML' }
       );
       return;
     }
   }
 
-  // Route 2: Render Standard HTML tags
+  // Route 2: HTML path
   if (rawInput.includes('<') && rawInput.includes('>')) {
+    const validation = validateTelegramHTML(rawInput);
+    if (!validation.ok) {
+      await ctx.reply(
+        `❌ <b>HTML Validation Failed</b>\n\n` +
+        `🚨 <b>Issue:</b> <code>${escapeHTML(validation.error)}</code>\n\n` +
+        `💡 <i>Tip:</i> Allowed tags: <code>${ALLOWED_HTML_TAGS.join(', ')}</code>.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
     try {
       await ctx.reply(`✨ <b>HTML Rendering Result:</b>\n\n${rawInput}`, { parse_mode: 'HTML' });
       return;
     } catch (htmlError) {
+      console.error('HTML rendering error:', htmlError);
       await ctx.reply(
-        `❌ <b>Standard HTML Parse Failure</b>\n\n` +
-        `🚨 <b>Error Vector:</b> <code>${escapeHTML(htmlError.message)}</code>\n\n` +
-        `💡 <i>Notice:</i> Standard HTML parsers block high-order structural blocks like grids, lists, or mathematical subscripts. Use the raw JSON schema path for those layout features!`,
+        `❌ <b>HTML Parse Failure</b>\n\n` +
+        `🚨 <b>Error:</b> <code>${escapeHTML(htmlError.message || String(htmlError))}</code>\n\n` +
+        `💡 <i>Tip:</i> Check allowed inline tags and ensure all attributes (like href on <a>) are valid URLs.`,
         { parse_mode: 'HTML' }
       );
       return;
     }
   }
 
-  // Route 3: Render Standard Typography Markdown
+  // Route 3: Markdown
   try {
+    const mdValidation = validateSimpleMarkdown(rawInput);
+    if (!mdValidation.ok) {
+      await ctx.reply(
+        `❌ <b>Markdown Validation Failed</b>\n\n` +
+        `🚨 <b>Issue:</b> <code>${escapeHTML(mdValidation.error)}</code>\n\n` +
+        `💡 <i>Tip:</i> Use escaping (backslashes) to show raw symbols or ensure pairs are balanced.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    // prefer MarkdownV2 if you expect many special characters (adjust if you want plain Markdown)
     await ctx.reply(`✨ *Markdown Rendering Result*:\n\n${rawInput}`, { parse_mode: 'Markdown' });
   } catch (markdownError) {
+    console.error('Markdown render error:', markdownError);
     await ctx.reply(
       `❌ <b>Markdown Parse Failure</b>\n\n` +
-      `🚨 <b>Error Vector:</b> <code>${escapeHTML(markdownError.message)}</code>\n\n` +
-      `💡 <i>Check:</i> Ensure all symbols (<code>*</code>, <code>_</code>, <code>\`</code>) are correctly closed and balanced.`,
+      `🚨 <b>Error:</b> <code>${escapeHTML(markdownError.message || String(markdownError))}</code>`,
       { parse_mode: 'HTML' }
     );
   }
 });
 
-bot.catch((err) => console.error('⚠️ Runtime Environment Exception Captured:', err.message));
+bot.catch((err) => console.error('Unhandled bot error:', err));
 
-// ==========================================
-// BUILT-IN REFERENCE GUIDE WEB INTERFACE (MINI APP)
-// ==========================================
 const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Formatting Blueprint Hub</title>
-      <script src="https://telegram.org/js/telegram-web-app.js"></script>
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #182533; color: #fff; padding: 15px; margin: 0; }
-        h2 { color: #64b5f6; margin-top: 0; border-bottom: 2px solid #24313f; padding-bottom: 8px; }
-        h3 { color: #81c784; margin-bottom: 6px; }
-        .card { background: #202b36; border: 1px solid #2b394a; border-radius: 8px; padding: 14px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        code { background: #111a24; padding: 2px 6px; border-radius: 4px; font-family: 'Courier New', Courier, monospace; color: #f48fb1; font-size: 13px; }
-        pre { background: #111a24; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; border: 1px solid #1a222c; }
-        ul { padding-left: 20px; margin: 8px 0; font-size: 14px; color: #b0bec5; }
-        li { margin-bottom: 4px; }
-      </style>
-    </head>
-    <body>
-      <h2>📖 Telegram Layout Specs Map</h2>
-      <p style="font-size: 13px; color: #b0bec5;">Quick-reference documentation engine configured for Bot API 10.1.</p>
-      
-      <div class="card">
-        <h3>1. Native Inline HTML Tags</h3>
-        <p style="font-size: 13px; margin: 4px 0;">Supported structures under <code>parse_mode: 'HTML'</code>:</p>
-        <ul>
-          <li><code>&lt;b&gt;bold text&lt;/b&gt;</code></li>
-          <li><code>&lt;i&gt;italicized text&lt;/i&gt;</code></li>
-          <li><code>&lt;u&gt;underlined text&lt;/u&gt;</code></li>
-          <li><code>&lt;s&gt;strikethrough text&lt;/s&gt;</code></li>
-          <li><code>&lt;tg-spoiler&gt;spoiler masking&lt;/tg-spoiler&gt;</code></li>
-          <li><code>&lt;code&gt;inline Monospace&lt;/code&gt;</code></li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <h3>2. Structural Rich Messages JSON Block</h3>
-        <p style="font-size: 13px; margin: 4px 0;">Pass structured code blocks to test layout matrices like native tables or inline headers:</p>
-        <pre>{
-  "blocks": [
-    {
-      "type": "heading",
-      "level": 1,
-      "text": { "text": "Leaderboard" }
-    },
-    {
-      "type": "table",
-      "rows": [
-        {
-          "cells": [
-            { "text": { "text": "Rank" } },
-            { "text": { "text": "User" } }
-          ]
-        }
-      ]
-    }
-  ]
-}</pre>
-      </div>
-
-      <script>
-        // Initialization configuration checks for the internal Telegram application sandbox
-        window.Telegram.WebApp.ready();
-        window.Telegram.WebApp.expand();
-      </script>
-    </body>
-    </html>
-  `);
+  res.end(`<html><body><h1>Formatting Blueprint Hub</h1></body></html>`);
 });
 
-server.listen(PORT, () => console.log(`🌐 Internal HTTP Server mapping tracking validations on port: ${PORT}`));
+server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
 
 bot.launch()
-  .then(() => console.log('🚀 Playground Infrastructure Initialization Succeeded.'))
-  .catch((err) => console.error('❌ Engine Launch Interrupted:', err.message));
+  .then(() => console.log('Bot launched'))
+  .catch((err) => console.error('Failed to launch bot:', err));
 
 process.once('SIGINT', () => { bot.stop('SIGINT'); server.close(); });
 process.once('SIGTERM', () => { bot.stop('SIGTERM'); server.close(); });
