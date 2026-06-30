@@ -1,7 +1,8 @@
 import { Telegraf } from 'telegraf';
+import http from 'http'; // <-- This was missing or got cut off!
 
 // ==========================================
-// CONFIGURATION: Replace the text inside the quotes with your BotFather token
+// CONFIGURATION: Replace with your token
 // ==========================================
 const BOT_TOKEN = '8842774625:AAHKbtnsqHjmyuMySVBW6hz9o716JOi4_qw';
 
@@ -50,7 +51,6 @@ bot.catch((err, ctx) => {
 // ==========================================
 // RENDER PORT BINDING FIX
 // ==========================================
-// This creates a tiny server to satisfy Render's port health check.
 const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
