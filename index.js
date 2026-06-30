@@ -6,11 +6,6 @@ import http from 'http';
 // ==========================================
 const BOT_TOKEN = '8842774625:AAHKbtnsqHjmyuMySVBW6hz9o716JOi4_qw';
 
-if (!BOT_TOKEN || BOT_TOKEN === '8842774625:AAHKbtnsqHjmyuMySVBW6hz9o716JOi4_qw') {
-  console.error('❌ CRITICAL CONFIGURATION ERROR: Please insert a valid Telegram Bot Token from BotFather.');
-  process.exit(1);
-}
-
 const bot = new Telegraf(BOT_TOKEN);
 
 // Utility string filter to sanitize text against UI presentation breaks
