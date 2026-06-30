@@ -30,32 +30,33 @@ bot.on('message', async (ctx) => {
   if (!ctx.message || !ctx.message.text) return;
   if (ctx.message.text.startsWith('/')) return; 
 
-  try {
-    const rawText = ctx.message.text;
+  const inputText = ctx.message.text;
 
-    // 1. Clean up the text so it doesn't break HTML parsing
-    const safeText = rawText
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
-
-    // 2. Wrap the text in HTML code tags so Telegram turns it into a copyable block
-    const formattedCodeBlock = `<pre><code>${safeText}</code></pre>`;
-
-    // 3. Send the formatted code back to the user
-    await ctx.reply(formattedCodeBlock, {
-      parse_mode: 'HTML'
-    });
-
-  } catch (error) {
-    console.error('Failed to process code message:', error.message);
-    
-    // Fallback if formatting fails
+  // 1. Try rendering as HTML first
+  if (inputText.includes('<') && inputText.includes('>')) {
     try {
-      await ctx.reply('⚠️ There was an error processing your code syntax.');
-    } catch (fallbackError) {
-      console.error('Critical fallback failure:', fallbackError.message);
+      await ctx.reply(`✨ *HTML Preview*:\n\n${inputText}`, { parse_mode: 'HTML' });
+      return; // Success! Stop here.
+    } catch (htmlError) {
+      // If HTML parsing fails (e.g. unclosed tags), move to fallback
+      console.log('HTML parsing failed, trying Markdown...');
     }
+  }
+
+  // 2. Try rendering as Markdown (supports legacy Markdown and MarkdownV2 symbols)
+  try {
+    await ctx.reply(`✨ *Markdown Preview*:\n\n${inputText}`, { parse_mode: 'Markdown' });
+  } catch (markdownError) {
+    
+    // 3. Fallback: If both fail, the user made a syntax error. Show them a helpful warning.
+    const safeText = inputText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    
+    await ctx.reply(
+      `❌ *Parsing Error!*\n\n` +
+      `Your code has a syntax error (like an unclosed tag or unescaped symbol).\n\n` +
+      `📦 *Raw Text Received*:\n<pre><code>${safeText}</code></pre>`, 
+      { parse_mode: 'HTML' }
+    );
   }
 });
 
