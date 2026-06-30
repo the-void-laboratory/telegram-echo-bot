@@ -31,12 +31,28 @@ bot.on('message', async (ctx) => {
   if (ctx.message.text.startsWith('/')) return; 
 
   try {
-    const entities = ctx.message.entities || [];
-    await ctx.reply(ctx.message.text, { entities: entities });
+    const rawText = ctx.message.text;
+
+    // 1. Clean up the text so it doesn't break HTML parsing
+    const safeText = rawText
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    // 2. Wrap the text in HTML code tags so Telegram turns it into a copyable block
+    const formattedCodeBlock = `<pre><code>${safeText}</code></pre>`;
+
+    // 3. Send the formatted code back to the user
+    await ctx.reply(formattedCodeBlock, {
+      parse_mode: 'HTML'
+    });
+
   } catch (error) {
-    console.error('Failed to echo message:', error.message);
+    console.error('Failed to process code message:', error.message);
+    
+    // Fallback if formatting fails
     try {
-      await ctx.reply(ctx.message.text);
+      await ctx.reply('⚠️ There was an error processing your code syntax.');
     } catch (fallbackError) {
       console.error('Critical fallback failure:', fallbackError.message);
     }
