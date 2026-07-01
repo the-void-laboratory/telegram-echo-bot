@@ -6,13 +6,11 @@ import { errorBoundary } from './middlewares/errorBoundary.js';
 import { registerCommands } from './commands/index.js';
 import { registerMenuHandlers } from './handlers/menuHandler.js';
 import { handleTextMessage } from './handlers/textHandler.js';
-import { handleForwardedBotMessage, registerInspectionActions } from './handlers/replicationHandler.js';
 const env = validateEnvironment();
 if (!env.ok) { env.errors.forEach((error) => logger.error(error)); process.exit(1); }
 const bot = new Telegraf(config.botToken);
 bot.use(errorBoundary());
-registerCommands(bot); registerMenuHandlers(bot); registerInspectionActions(bot);
-bot.use(handleForwardedBotMessage);
+registerCommands(bot); registerMenuHandlers(bot);
 bot.on('message', handleTextMessage);
 bot.catch((err) => logger.error('Unhandled bot error', err));
 createServer().listen(config.port, () => logger.info(`Server listening on ${config.port}`));
