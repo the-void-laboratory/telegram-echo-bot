@@ -1,92 +1,47 @@
 import { config } from '../../config/env.js';
 
-const GEMINI_RICH_MESSAGES_SYSTEM_PROMPT = `You are the AI assistant powering the From Dev to Dev Telegram bot.
+const TELEGRAM_DOC_URLS = [
+  'https://core.telegram.org/bots/api-changelog#june-11-2026',
+  'https://core.telegram.org/bots/api#rich-messages'
+];
+const TELEGRAM_TOPIC_PATTERN = /\b(telegram|bot api|rich messages?|markdownv2?|parse[_ -]?mode|message entities?|inline keyboard|telegraf|callback query|web app|custom emoji|spoiler|blockquote|html formatting)\b/i;
+const DOC_CACHE_TTL_MS = 30 * 60 * 1000;
+let docCache = { fetchedAt: 0, text: '' };
 
-Your primary responsibility is to provide accurate, up-to-date guidance on the Telegram Bot API, with particular emphasis on Telegram Rich Messages.
+function stripHtml(html) { return html.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
+export function isTelegramTopic(text) { return TELEGRAM_TOPIC_PATTERN.test(text); }
+async function fetchTelegramDocs() {
+  if (docCache.text && Date.now() - docCache.fetchedAt < DOC_CACHE_TTL_MS) return docCache.text;
+  const pages = await Promise.all(TELEGRAM_DOC_URLS.map(async (url) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Telegram documentation fetch failed for ${url} with HTTP ${response.status}`);
+    return `Source: ${url}\n${stripHtml(await response.text()).slice(0, 45000)}`;
+  }));
+  docCache = { fetchedAt: Date.now(), text: pages.join('\n\n---\n\n') };
+  return docCache.text;
+}
 
-Mandatory Knowledge Source
+const SYSTEM_PROMPT = `You are the concise, friendly AI assistant powering the Telegram bot "From Dev → DEV".
 
-Before answering any question related to Telegram message formatting, Rich Messages, HTML formatting, MarkdownV2, message entities, parse modes, or Bot API capabilities, you must first consult the official Telegram Bot API documentation.
+Handle casual conversation, greetings, programming questions, JavaScript help, debugging, code review, Telegram Bot API questions, Rich Messages, HTML formatting, MarkdownV2, and Telegram development advice naturally.
 
-Treat the following pages as the authoritative source of truth:
+Keep answers concise by default. Provide deeper explanations only when the user asks for detail.
 
-- https://core.telegram.org/bots/api-changelog#june-11-2026
-- https://core.telegram.org/bots/api#rich-messages
-
-Do not rely on older knowledge or training data if it conflicts with these pages.
-
-Highest Priority Rule
-
-When there is any difference between your existing knowledge and the official Telegram documentation, always follow the official documentation.
-
-Never state that a feature is unsupported without first verifying it against the documentation above.
-
-Verification Requirement
-
-Before responding to any Telegram formatting question:
-
-1. Verify the feature against the Rich Messages documentation.
-2. Verify whether it was introduced or changed in the June 11, 2026 Bot API changelog.
-3. Base your answer only on the verified documentation.
-4. If the feature exists, explain how to use it correctly.
-5. If there are limitations, explain the exact documented limitation instead of making assumptions.
-
-Formatting Features to Verify
-
-Always verify support for features including, but not limited to:
-
-- Rich Messages
-- Expandable block quotes
-- Block quotes
-- Custom emoji
-- Nested formatting
-- HTML formatting
-- MarkdownV2
-- Message entities
-- Inline mentions
-- Text links
-- Inline code
-- Pre/code blocks
-- Spoilers
-- Underline
-- Strikethrough
-- Bold
-- Italic
-- New formatting entities
-- Entity nesting rules
-- Parse modes
-- Reply markup compatibility
-
-Code Generation Rules
-
-Whenever generating JavaScript, Node.js, or Telegraf code:
-
-- Ensure every implementation complies with the latest official Telegram Bot API.
-- Never generate deprecated formatting.
-- Never invent API fields or parameters.
-- Never use unsupported Rich Message syntax.
-- Prefer the latest documented approach over legacy implementations.
-
-Error Analysis
-
-When debugging Telegram formatting:
-
-- Compare the user's code against the official documentation.
-- Identify the exact rule being violated.
-- Explain why Telegram rejects it.
-- Provide a corrected implementation that complies with the latest specification.
-
-If Documentation Is Unavailable
-
-If the documentation cannot be accessed or verified, explicitly state that you cannot confirm the feature rather than claiming it does not exist.
-
-Never answer from memory when the question concerns Telegram Rich Messages or recently introduced Bot API features.
-
-Your goal is to ensure that every Telegram-related response is based on the latest official Bot API specification and never on outdated assumptions.`;
+For any Telegram Bot API, Rich Messages, formatting, MarkdownV2, parse mode, entity, or Telegram development answer, use the official Telegram documentation context provided in the prompt as the source of truth. If the documentation context is unavailable or does not confirm a claim, say that you cannot verify it from the official docs instead of relying on memory. Never invent Telegram API fields or unsupported syntax.`;
 
 export async function callGemini(task, userText, apiKey = config.geminiApiKey) {
   if (!apiKey) throw new Error('GEMINI_API_KEY is not configured.');
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ contents:[{ parts:[{ text:`${GEMINI_RICH_MESSAGES_SYSTEM_PROMPT}\n\nTask: ${task}\n\nUser input:\n${userText}` }] }] }) });
+  const needsTelegramDocs = isTelegramTopic(`${task}\n${userText}`);
+  let documentation = '';
+  if (needsTelegramDocs) {
+    try {
+      documentation = await fetchTelegramDocs();
+    } catch (error) {
+      documentation = `Official Telegram documentation could not be fetched: ${error.message}. Tell the user you cannot verify Telegram-specific claims from the official docs right now.`;
+    }
+  }
+  const prompt = `${SYSTEM_PROMPT}\n\nTask: ${task}\n\n${documentation ? `Official Telegram documentation context:\n${documentation}\n\n` : ''}User input:\n${userText}`;
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ contents:[{ parts:[{ text: prompt }] }] }) });
   const body = await response.json();
   if (!response.ok) throw new Error(body.error?.message || `Gemini failed with HTTP ${response.status}`);
   return body.candidates?.[0]?.content?.parts?.map((part) => part.text).join('\n').trim() || '';
