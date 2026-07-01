@@ -159,14 +159,6 @@ function validateRichHTML(html) {
       if (stack.length > MAX_NESTING_DEPTH) errors.push({ index: match.index, message: 'Nesting exceeds 16 levels.', fix: 'Flatten nested formatting or blocks.' });
     }
   }
-  if (/<[a-zA-Z][^>]*>/.test(trimmed) || /<\/[a-zA-Z][^>]*>/.test(trimmed)) return { kind: 'rich-html', content: trimmed };
-  return { kind: 'rich-markdown', content: trimmed };
-}
-
-  while (stack.length) errors.push({ index: html.length, message: `Unclosed tag <${stack.pop()}>.`, fix: 'Add the missing closing tag.' });
-  return { ok: errors.length === 0, errors };
-}
-
   while (stack.length) errors.push({ index: html.length, message: `Unclosed tag <${stack.pop()}>.`, fix: 'Add the missing closing tag.' });
   return { ok: errors.length === 0, errors };
 }
