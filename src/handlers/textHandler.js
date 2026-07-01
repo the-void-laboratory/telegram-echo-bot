@@ -8,6 +8,7 @@ import { validateRichMessageInput } from '../validators/richMessageValidator.js'
 import { detectFormat } from '../parsers/formatParser.js';
 import { escapeHTML, truncate } from '../utils/html.js';
 import { menuKeyboard } from '../keyboards/menuKeyboard.js';
+import { buildBeautificationTask, extractBeautificationText, isBeautificationRequest, parseRichMessageJson } from '../services/formatter/beautifier.js';
 function isOwner(ctx) { return Boolean(config.botOwnerId && Number(ctx.from?.id) === config.botOwnerId); }
 function getGeminiApiKey(ctx) { const session = getSession(ctx.from.id); return isOwner(ctx) && session.geminiApiKey ? session.geminiApiKey : config.geminiApiKey; }
 export async function replyValidation(ctx, input, autoFix = false) {
@@ -30,6 +31,7 @@ export async function preview(ctx, input) {
 async function answerWithAssistant(ctx, input) {
   await ctx.sendChatAction('typing');
   try {
+    if (isBeautificationRequest(input)) return answerWithBeautifiedRichMessage(ctx, input);
     const answer = await callGemini('Reply as a natural developer assistant. Keep it concise unless the user asks for depth.', input, getGeminiApiKey(ctx));
     return ctx.reply(escapeHTML(truncate(answer, 3900)), { parse_mode:'HTML', ...menuKeyboard() });
   } catch (error) {
@@ -37,9 +39,32 @@ async function answerWithAssistant(ctx, input) {
     return ctx.reply(message, { parse_mode:'HTML', ...menuKeyboard() });
   }
 }
+async function answerWithBeautifiedRichMessage(ctx, input) {
+  const textToBeautify = extractBeautificationText(input);
+  if (!textToBeautify.trim()) return ctx.reply('Send the text you want beautified, and I will format it as a Telegram Rich Message.', { parse_mode:'HTML', ...menuKeyboard() });
+  let validationErrors = [];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const output = await callGemini(buildBeautificationTask(textToBeautify, validationErrors), textToBeautify, getGeminiApiKey(ctx));
+    let richMessage;
+    try {
+      richMessage = parseRichMessageJson(output);
+    } catch (error) {
+      validationErrors = [{ index:0, message:error.message || 'Invalid Rich Message JSON.' }];
+      continue;
+    }
+    const validation = validateRichMessageInput(richMessage);
+    if (validation.ok) {
+      await sendRichMessage(ctx, richMessage);
+      return undefined;
+    }
+    validationErrors = validation.errors;
+  }
+  const issues = validationErrors.map((error, index) => `${index + 1}. offset ${error.index}: ${escapeHTML(error.message)}`).join('\n');
+  return ctx.reply(`I generated a Rich Message, but it did not pass validation yet.\n\n<pre>${issues}</pre>`, { parse_mode:'HTML', ...menuKeyboard() });
+}
 export async function handleTextMessage(ctx) {
   if (!ctx.message?.text || ctx.message.text.startsWith('/')) return;
-  const session = getSession(ctx.from.id); const input = ctx.message.text.trim();
+  const session = getSession(ctx.from.id); const input = ctx.message.text;
   if (session.mode === 'validate') return replyValidation(ctx, input);
   if (session.mode === 'fix') return replyValidation(ctx, input, true);
   if (session.mode === 'preview') return preview(ctx, input);
