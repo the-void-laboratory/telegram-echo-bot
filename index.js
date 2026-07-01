@@ -1,243 +1,362 @@
-// name=index.js
 import { Telegraf, Markup } from 'telegraf';
 import http from 'http';
-import fetch from 'node-fetch'; // if your environment doesn't include fetch, install node-fetch
 
-// IMPORTANT: Use environment variable for bot token
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const DEFAULT_GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const BOT_OWNER_ID = Number(process.env.BOT_OWNER_ID || process.env.OWNER_TELEGRAM_ID || process.env.OWNER_ID || 0);
+const PUBLIC_HOST = process.env.RENDER_EXTERNAL_HOSTNAME || process.env.PUBLIC_HOST || 'localhost:3000';
+const PORT = process.env.PORT || 3000;
+const MAX_RICH_TEXT_LENGTH = 32768;
+const MAX_NESTING_DEPTH = 16;
+
 if (!BOT_TOKEN) {
   console.error('Missing BOT_TOKEN environment variable. Set BOT_TOKEN before launching the bot.');
   process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
+const sessions = new Map();
 
-// Utility string filter to sanitize text against UI presentation breaks
-const escapeHTML = (str) => String(str)
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;');
-
-// Allowed inline HTML tags per Telegram subset (keep this conservative)
-const ALLOWED_HTML_TAGS = [
-  'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'tg-spoiler', 'code', 'pre', 'a'
+const MENU = [
+  ['📖 Preview Text', '✨ Beautify Text (AI)'],
+  ['🛠 Validate Formatting', '🔍 Fix Formatting'],
+  ['🧠 Ask AI', '📚 Formatting Guide'],
+  ['🆕 Rich Messages Examples', '⚙️ Settings'],
+  ['❓ Help']
 ];
 
-// Lightweight validator for Telegram-style HTML: checks allowed tags and basic balancing
-function validateTelegramHTML(input) {
-  const tagRegex = /<\/?([a-zA-Z0-9-]+)(?:\s+[^>]*)?>/g;
+const RICH_HTML_TAGS = new Set([
+  'a', 'b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'mark',
+  'sub', 'sup', 'tg-spoiler', 'tg-reference', 'tg-emoji', 'img', 'tg-time', 'tg-math',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'footer', 'hr', 'ul', 'ol', 'li', 'input',
+  'blockquote', 'cite', 'aside', 'video', 'audio', 'figure', 'figcaption', 'tg-map',
+  'tg-collage', 'tg-slideshow', 'table', 'caption', 'tr', 'th', 'td', 'details', 'summary',
+  'tg-math-block', 'br'
+]);
+
+const VOID_TAGS = new Set(['br', 'hr', 'img', 'input', 'tg-map']);
+const NAMED_ENTITIES = new Set(['lt', 'gt', 'amp', 'quot', 'apos', 'nbsp', 'hellip', 'mdash', 'ndash', 'lsquo', 'rsquo', 'ldquo', 'rdquo']);
+function getSession(userId) {
+  if (!sessions.has(userId)) sessions.set(userId, { mode: 'preview', format: 'rich-html', skipEntityDetection: false, isRtl: false, geminiApiKey: null });
+  return sessions.get(userId);
+}
+
+function escapeHTML(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function truncate(value, limit = 3600) {
+  const text = String(value || '');
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+function menuKeyboard() {
+  return Markup.keyboard(MENU).resize();
+}
+
+function isOwner(ctx) {
+  return Boolean(BOT_OWNER_ID && ctx.from && Number(ctx.from.id) === BOT_OWNER_ID);
+}
+
+function ownerOnlyMessage() {
+  return '🔒 This command is owner-only. Set <code>BOT_OWNER_ID</code> to your numeric Telegram user ID in the hosting environment to enable owner commands.';
+}
+
+function getGeminiApiKey(ctx) {
+  const session = getSession(ctx.from.id);
+  return isOwner(ctx) && session.geminiApiKey ? session.geminiApiKey : DEFAULT_GEMINI_API_KEY;
+}
+
+function mainMenuText(firstName = 'Developer') {
+  return `🛠️ <b>From Dev to Dev</b>\n\nHello <b>${escapeHTML(firstName)}</b>. Choose a workflow below, or send text directly to preview Telegram Rich Messages.\n\n<b>Main features</b>\n• Preview Rich HTML / Rich Markdown\n• Validate formatting and see exact issues\n• Auto-fix safe HTML mistakes\n• Beautify text with Gemini\n• Ask AI formatting questions\n• Browse examples and guide`;
+}
+
+function helpText(hasGlobalGeminiKey, hasSessionGeminiKey, ownerConfigured) {
+  const geminiStatus = hasSessionGeminiKey
+    ? 'configured for this chat session'
+    : hasGlobalGeminiKey
+      ? 'configured globally from GEMINI_API_KEY'
+      : 'not configured yet';
+
+  return `❓ <b>Help</b>\n\n<b>How to use</b>\n1. Tap <b>📖 Preview Text</b> and send Rich HTML, Rich Markdown, or JSON like <code>{"html":"&lt;h1&gt;Hi&lt;/h1&gt;"}</code>.\n2. Tap <b>🛠 Validate Formatting</b> to check code without sending it as a Rich Message.\n3. Tap <b>🔍 Fix Formatting</b> to repair simple HTML issues, such as unsupported tags or missing closing tags.\n4. Tap <b>✨ Beautify Text (AI)</b> and send plain text to generate valid Telegram Rich HTML.\n5. Tap <b>🧠 Ask AI</b> to ask Telegram formatting questions.\n\n<b>Gemini API key</b>\nCurrent status: <code>${geminiStatus}</code>.\nRecommended deployment method: set an environment variable named <code>GEMINI_API_KEY</code> in your hosting dashboard, then restart the bot.\nOwner-only temporary method: send <code>/setgemini YOUR_API_KEY</code>. This stores the key only in memory until the bot restarts and only works for <code>BOT_OWNER_ID</code>.\nTo remove the temporary owner key, send <code>/cleargemini</code>.\nOwner protection: <code>${ownerConfigured ? 'configured' : 'not configured'}</code>.\n\n<b>Useful commands</b>\n/start - show start menu\n/menu - show main menu\n/help - show this help\n/settings - show settings\n/myid - show your Telegram numeric user ID\n/setgemini KEY - owner-only temporary Gemini key\n/cleargemini - owner-only remove temporary Gemini key`;
+}
+
+function settingsText(session) {
+  return `⚙️ <b>Settings</b>\n\nMode: <code>${session.mode}</code>\nDefault preview format: <code>${session.format}</code>\nRTL: <code>${session.isRtl ? 'on' : 'off'}</code>\nSkip entity detection: <code>${session.skipEntityDetection ? 'on' : 'off'}</code>\nGemini session key: <code>${session.geminiApiKey ? 'configured' : 'not configured'}</code>\nGlobal Gemini key: <code>${DEFAULT_GEMINI_API_KEY ? 'configured' : 'not configured'}</code>\nOwner ID: <code>${BOT_OWNER_ID || 'not configured'}</code>\n\nSet Gemini globally with the <code>GEMINI_API_KEY</code> environment variable. Owner-only temporary keys require <code>BOT_OWNER_ID</code> plus <code>/setgemini YOUR_API_KEY</code>.`;
+}
+
+function modePrompt(mode) {
+  const prompts = {
+    preview: 'Send HTML, Markdown, or {"html":"..."}/{"markdown":"..."} to preview it as a Telegram Rich Message.',
+    beautify: 'Send plain text. Gemini will convert it into valid Telegram Rich Message HTML.',
+    validate: 'Send HTML, MarkdownV2/Rich Markdown, or an InputRichMessage JSON object to validate.',
+    fix: 'Send broken formatting. I will explain the error and repair what can be repaired safely.',
+    ask: 'Ask any Telegram formatting question. Gemini will answer using strict Bot API Rich Message rules.'
+  };
+  return prompts[mode] || prompts.preview;
+}
+
+function detectFormat(input) {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed.html === 'string') return { kind: 'rich-html', content: parsed.html, options: parsed };
+      if (typeof parsed.markdown === 'string') return { kind: 'rich-markdown', content: parsed.markdown, options: parsed };
+      return { kind: 'json', content: trimmed, options: parsed };
+    } catch {
+      return { kind: 'json-invalid', content: trimmed };
+    }
+  }
+  if (/<[a-zA-Z][^>]*>/.test(trimmed) || /<\/[a-zA-Z][^>]*>/.test(trimmed)) return { kind: 'rich-html', content: trimmed };
+  return { kind: 'rich-markdown', content: trimmed };
+}
+
+function validateRichMessageInput(input) {
+  const detected = typeof input === 'string' ? detectFormat(input) : { kind: input.html ? 'rich-html' : 'rich-markdown', content: input.html || input.markdown, options: input };
+  if (detected.kind === 'json-invalid') return { ok: false, errors: [{ index: 0, message: 'Invalid JSON.', fix: 'Use {"html":"..."} or {"markdown":"..."} for InputRichMessage.' }] };
+  if (detected.kind === 'json') return { ok: false, errors: [{ index: 0, message: 'Unsupported JSON shape for sending.', fix: 'Bot API 10.1 InputRichMessage must contain exactly one of html or markdown; received structural RichMessage JSON, which is a response object, not a send payload.' }] };
+  const options = detected.options || {};
+  if (options.html && options.markdown) return { ok: false, errors: [{ index: 0, message: 'InputRichMessage uses both html and markdown.', fix: 'Use exactly one of html or markdown.' }] };
+  if (!detected.content || detected.content.length === 0) return { ok: false, errors: [{ index: 0, message: 'Message is empty.', fix: 'Send non-empty rich message content.' }] };
+  if (Buffer.byteLength(detected.content, 'utf8') > MAX_RICH_TEXT_LENGTH) return { ok: false, errors: [{ index: MAX_RICH_TEXT_LENGTH, message: 'Rich message exceeds 32768 UTF-8 characters.', fix: 'Shorten the message or split it.' }] };
+  return detected.kind === 'rich-html' ? validateRichHTML(detected.content) : validateRichMarkdown(detected.content);
+}
+
+function validateRichHTML(html) {
+  const errors = [];
   const stack = [];
+  const tagPattern = /<\/?([a-zA-Z][a-zA-Z0-9-]*)(\s[^<>]*)?>/g;
+  const entityPattern = /&([a-zA-Z]+|#[0-9]+|#x[0-9a-fA-F]+);/g;
   let match;
 
-  while ((match = tagRegex.exec(input)) !== null) {
+  while ((match = entityPattern.exec(html))) {
+    const name = match[1];
+    if (!name.startsWith('#') && !NAMED_ENTITIES.has(name)) errors.push({ index: match.index, message: `Unsupported named HTML entity &${name};`, fix: 'Use a supported named entity or a numeric HTML entity.' });
+  }
+
+  while ((match = tagPattern.exec(html))) {
     const full = match[0];
-    const tag = match[1];
-    const isClosing = /^<\//.test(full);
+    const tag = match[1].toLowerCase();
+    const attrs = match[2] || '';
+    const closing = full.startsWith('</');
+    const selfClosing = /\/\s*>$/.test(full) || VOID_TAGS.has(tag);
 
-    if (!ALLOWED_HTML_TAGS.includes(tag)) {
-      return { ok: false, error: `Unsupported HTML tag: <${tag}>` };
-    }
+    if (!RICH_HTML_TAGS.has(tag)) errors.push({ index: match.index, message: `Unsupported Rich HTML tag <${tag}>.`, fix: 'Use only tags listed in Telegram Rich HTML formatting options.' });
+    if (tag === 'tg-thinking') errors.push({ index: match.index, message: '<tg-thinking> is draft-only.', fix: 'Use it only with sendRichMessageDraft, not final sendRichMessage.' });
+    if ((tag === 'img' || tag === 'video' || tag === 'audio') && /src\s*=\s*['"](?!https?:\/\/|tg:\/\/emoji\?id=)/i.test(attrs)) errors.push({ index: match.index, message: 'Media block src must be HTTP/HTTPS; custom emoji image may use tg://emoji.', fix: 'Use https:// URLs for media blocks.' });
+    if (tag === 'code' && /class\s*=\s*['"]language-/i.test(attrs) && stack.at(-1) !== 'pre') errors.push({ index: match.index, message: 'Programming language cannot be specified for standalone code.', fix: 'Nest code inside pre: <pre><code class="language-js">...</code></pre>.' });
 
-    if (isClosing) {
-      if (stack.length === 0 || stack[stack.length - 1] !== tag) {
-        return { ok: false, error: `Mismatched or unexpected closing tag: </${tag}>` };
-      }
-      stack.pop();
-    } else {
-      // treat <br> as no-op
-      if (/^<br\s*\/?>$/i.test(full)) continue;
+    if (closing) {
+      const expected = stack.pop();
+      if (expected !== tag) errors.push({ index: match.index, message: `Mismatched closing tag </${tag}>; expected </${expected || 'none'}>.`, fix: 'Close tags in strict LIFO order.' });
+    } else if (!selfClosing) {
       stack.push(tag);
+      if (stack.length > MAX_NESTING_DEPTH) errors.push({ index: match.index, message: 'Nesting exceeds 16 levels.', fix: 'Flatten nested formatting or blocks.' });
     }
   }
 
-  if (stack.length !== 0) {
-    return { ok: false, error: `Unclosed tag: <${stack[stack.length - 1]}>` };
-  }
-
-  return { ok: true };
+  while (stack.length) errors.push({ index: html.length, message: `Unclosed tag <${stack.pop()}>.`, fix: 'Add the missing closing tag.' });
+  return { ok: errors.length === 0, errors };
 }
 
-// Basic Markdown-ish validator to catch unbalanced *, _, and backticks
-function validateSimpleMarkdown(input) {
-  const counts = {
-    '*': (input.match(/\*/g) || []).length,
-    '_': (input.match(/_/g) || []).length,
-    '`': (input.match(/`/g) || []).length,
+function validateRichMarkdown(markdown) {
+  const errors = [];
+  const fences = (markdown.match(/```/g) || []).length;
+  if (fences % 2 !== 0) errors.push({ index: markdown.lastIndexOf('```'), message: 'Unclosed fenced code block.', fix: 'Add a closing ``` fence.' });
+  for (const token of ['**', '__', '~~', '==', '||']) {
+    const count = (markdown.match(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+    if (count % 2 !== 0) errors.push({ index: markdown.lastIndexOf(token), message: `Unbalanced ${token} delimiter.`, fix: `Add the matching ${token} delimiter or escape the literal characters.` });
+  }
+  const singleBackticks = (markdown.replace(/```[\s\S]*?```/g, '').match(/`/g) || []).length;
+  if (singleBackticks % 2 !== 0) errors.push({ index: markdown.lastIndexOf('`'), message: 'Unbalanced inline code backtick.', fix: 'Add a matching ` or escape the literal backtick.' });
+  const htmlValidation = validateRichHTML(markdown);
+  errors.push(...htmlValidation.errors.filter((error) => /Unsupported Rich HTML tag|Mismatched|Unclosed|draft-only|Media block/.test(error.message)));
+  return { ok: errors.length === 0, errors };
+}
+
+function repairHTML(input) {
+  let output = input.replace(/&(?!([a-zA-Z]+|#[0-9]+|#x[0-9a-fA-F]+);)/g, '&amp;');
+  for (const entity of output.matchAll(/&([a-zA-Z]+);/g)) {
+    if (!NAMED_ENTITIES.has(entity[1])) output = output.replaceAll(entity[0], `&amp;${entity[1]};`);
+  }
+  output = output.replace(/<\/?([a-zA-Z][a-zA-Z0-9-]*)(\s[^<>]*)?>/g, (full, tag) => RICH_HTML_TAGS.has(tag.toLowerCase()) ? full : escapeHTML(full));
+  const stack = [];
+  output.replace(/<\/?([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^<>]*)?>/g, (full, tag) => {
+    tag = tag.toLowerCase();
+    if (full.startsWith('</')) {
+      if (stack.at(-1) === tag) stack.pop();
+    } else if (!VOID_TAGS.has(tag) && !/\/\s*>$/.test(full)) stack.push(tag);
+    return full;
+  });
+  while (stack.length) output += `</${stack.pop()}>`;
+  return output;
+}
+
+function buildRichMessage(input, session = {}) {
+  const detected = detectFormat(input);
+  const base = detected.options && (detected.options.html || detected.options.markdown)
+    ? detected.options
+    : detected.kind === 'rich-html'
+      ? { html: detected.content }
+      : { markdown: detected.content };
+  return {
+    ...('html' in base ? { html: base.html } : { markdown: base.markdown }),
+    is_rtl: Boolean(base.is_rtl ?? session.isRtl),
+    skip_entity_detection: Boolean(base.skip_entity_detection ?? session.skipEntityDetection)
   };
-
-  if (counts['*'] % 2 !== 0) return { ok: false, error: "Unbalanced '*' characters (bold/italic)." };
-  if (counts['_'] % 2 !== 0) return { ok: false, error: "Unbalanced '_' characters (italic)." };
-  if (counts['`'] % 2 !== 0) return { ok: false, error: "Unbalanced '`' characters (inline/pre code)." };
-
-  return { ok: true };
 }
 
-// Minimal example InputRichMessage to use as a test payload
-const SAMPLE_RICH_MESSAGE = {
-  blocks: [
-    { type: 'heading', level: 1, text: { text: 'Example' } },
-    { type: 'paragraph', text: { text: 'Hello — this is a rich message test.' } }
-  ]
-};
+async function callTelegram(method, payload) {
+  const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.ok === false) throw new Error(body.description || `Telegram ${method} failed with HTTP ${response.status}`);
+  return body.result;
+}
 
-// Helper to call Telegram sendRichMessage with robust logging and a fallback raw request
-async function safeSendRichMessage(ctx, richMessage) {
-  try {
-    // Primary: use Telegraf's callApi
-    return await ctx.telegram.callApi('sendRichMessage', {
-      chat_id: ctx.chat.id,
-      rich_message: richMessage
-    });
-  } catch (err) {
-    // log full error for debugging
-    console.error('callApi sendRichMessage error:', err && err.response ? err.response : err);
+async function sendRichMessage(ctx, richMessage) {
+  return callTelegram('sendRichMessage', { chat_id: ctx.chat.id, rich_message: richMessage });
+}
 
-    // If Telegram says unknown method or the library can't call it, try a raw HTTP POST to the Bot API
-    // This helps differentiate "method not available" vs "payload invalid"
-    try {
-      const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendRichMessage`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: ctx.chat.id, rich_message: richMessage })
-      });
-      const body = await res.json();
-      if (!res.ok || !body || body.ok === false) {
-        const info = body && body.description ? `${body.description} (${JSON.stringify(body)})` : JSON.stringify(body);
-        const e = new Error(`Telegram API raw POST failed: ${info}`);
-        e.telegram = body;
-        throw e;
-      }
-      return body;
-    } catch (rawErr) {
-      // Surface the most useful messages back to the user
-      console.error('Raw POST sendRichMessage error:', rawErr && rawErr.telegram ? rawErr.telegram : rawErr);
-      throw rawErr;
-    }
+async function callGemini(task, userText, apiKey = DEFAULT_GEMINI_API_KEY) {
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured. Set it in the hosting environment or send /setgemini YOUR_API_KEY in a private chat.');
+  const system = `You are a Telegram Bot API 10.1 Rich Messages expert. Output only valid Telegram Rich HTML unless asked a question. InputRichMessage uses exactly one of html or markdown. Do not emit structural RichMessage JSON for sending. Supported Rich HTML includes headings h1-h6, p, lists, blockquote, aside, details/summary, table, pre/code, mark, sub, sup, tg-spoiler, tg-emoji, tg-time, tg-math, tg-math-block, media blocks with HTTP/HTTPS URLs. Avoid unsupported tags and invalid nesting.`;
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: `${system}\n\nTask: ${task}\n\nUser input:\n${userText}` }] }] })
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error?.message || `Gemini failed with HTTP ${response.status}`);
+  return body.candidates?.[0]?.content?.parts?.map((part) => part.text).join('\n').trim() || '';
+}
+
+async function replyValidation(ctx, input, autoFix = false) {
+  const validation = validateRichMessageInput(input);
+  const detected = detectFormat(input);
+  let repaired = detected.kind === 'rich-html' ? repairHTML(detected.content) : detected.content;
+  const repairedValidation = validateRichMessageInput(repaired);
+  const issues = validation.ok ? 'No validation errors found.' : validation.errors.map((e, index) => `${index + 1}. offset ${e.index}: ${escapeHTML(e.message)}\n   Fix: ${escapeHTML(e.fix)}`).join('\n');
+  let message = `${validation.ok ? '✅' : '❌'} <b>Formatting Validation</b>\n\n<pre>${issues}</pre>`;
+  if (autoFix && !validation.ok && repairedValidation.ok) message += `\n\n<b>Auto-repaired ${detected.kind === 'rich-html' ? 'HTML' : 'Markdown'}:</b>\n<pre>${escapeHTML(truncate(repaired))}</pre>`;
+  await ctx.reply(message, { parse_mode: 'HTML' });
+}
+
+async function preview(ctx, input) {
+  const validation = validateRichMessageInput(input);
+  if (!validation.ok) return replyValidation(ctx, input);
+  const richMessage = buildRichMessage(input, getSession(ctx.from.id));
+  await sendRichMessage(ctx, richMessage);
+  await ctx.reply(`<b>Underlying InputRichMessage</b>\n<pre>${escapeHTML(JSON.stringify(richMessage, null, 2))}</pre>`, { parse_mode: 'HTML' });
+}
+
+bot.start((ctx) => ctx.reply(
+  `${mainMenuText(ctx.from.first_name || 'Developer')}\n\n${modePrompt('preview')}`,
+  { parse_mode: 'HTML', ...menuKeyboard() }
+));
+
+bot.command('menu', (ctx) => ctx.reply(mainMenuText(ctx.from.first_name || 'Developer'), { parse_mode: 'HTML', ...menuKeyboard() }));
+
+bot.command('help', (ctx) => {
+  const session = getSession(ctx.from.id);
+  return ctx.reply(helpText(Boolean(DEFAULT_GEMINI_API_KEY), Boolean(isOwner(ctx) && session.geminiApiKey), Boolean(BOT_OWNER_ID)), { parse_mode: 'HTML', ...menuKeyboard() });
+});
+
+bot.command('settings', (ctx) => ctx.reply(settingsText(getSession(ctx.from.id)), { parse_mode: 'HTML', ...menuKeyboard() }));
+
+bot.command('myid', (ctx) => ctx.reply(`Your Telegram user ID is: <code>${ctx.from.id}</code>\n\nSet <code>BOT_OWNER_ID=${ctx.from.id}</code> in your hosting environment to enable owner-only commands for your account.`, { parse_mode: 'HTML' }));
+
+bot.command('setgemini', (ctx) => {
+  if (!isOwner(ctx)) return ctx.reply(ownerOnlyMessage(), { parse_mode: 'HTML' });
+
+  const key = ctx.message.text.replace(/^\/setgemini(@\w+)?\s*/i, '').trim();
+  if (!key) {
+    return ctx.reply('Send your key like this in a private chat: <code>/setgemini YOUR_API_KEY</code>\n\nFor production, set <code>GEMINI_API_KEY</code> in your hosting environment instead.', { parse_mode: 'HTML' });
   }
-}
 
-// Bot handlers
-bot.start((ctx) => {
-  const firstName = ctx.from.first_name || 'Developer';
-  const miniAppUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost:3000'}/`;
+  const session = getSession(ctx.from.id);
+  session.geminiApiKey = key;
+  return ctx.reply('✅ Gemini API key saved for this in-memory chat session. It will be lost when the bot restarts. For production, use the GEMINI_API_KEY environment variable.', menuKeyboard());
+});
 
-  ctx.reply(
-    `🛠️ <b>Telegram Rich Message & Layout Engine Playground</b>\n\n` +
-    `Hello <b>${escapeHTML(firstName)}</b>! Use this environment canvas to dry-run and stress-test your layout rendering outputs against the native Telegram Bot API rules.\n\n` +
-    `🔹 <b>Validation Rules:</b>\n` +
-    `• <b>HTML Engine:</b> Send native code patterns (e.g., <code>&lt;tg-spoiler&gt;text&lt;/tg-spoiler&gt;</code>).\n` +
-    `• <b>Markdown Engine:</b> Send raw typography flags (e.g., <code>*bold text*</code>).\n` +
-    `• <b>Rich Structural JSON:</b> Wrap your payload parameters inside standard brackets <code>{ ... }</code> to use the <code>sendRichMessage</code> API endpoint (for tables, headers, lists).\n` +
-    `👇 Click the layout button below to inspect the interactive structural specifications map directly inside Telegram!`,
-    {
-      parse_mode: 'HTML',
-      ...Markup.inlineKeyboard([
-        [Markup.button.webApp('📖 Launch Interactive Mini App Hub', miniAppUrl)]
-      ])
-    }
-  );
+bot.command('cleargemini', (ctx) => {
+  if (!isOwner(ctx)) return ctx.reply(ownerOnlyMessage(), { parse_mode: 'HTML' });
+
+  const session = getSession(ctx.from.id);
+  session.geminiApiKey = null;
+  return ctx.reply('✅ Temporary Gemini API key cleared for this chat session.', menuKeyboard());
+});
+
+bot.action(/^mode:(preview|beautify|validate|fix|ask)$/, async (ctx) => {
+  const session = getSession(ctx.from.id);
+  session.mode = ctx.match[1];
+  await ctx.answerCbQuery();
+  return ctx.reply(modePrompt(session.mode), menuKeyboard());
+});
+
+bot.action('help', async (ctx) => {
+  const session = getSession(ctx.from.id);
+  await ctx.answerCbQuery();
+  return ctx.reply(helpText(Boolean(DEFAULT_GEMINI_API_KEY), Boolean(isOwner(ctx) && session.geminiApiKey), Boolean(BOT_OWNER_ID)), { parse_mode: 'HTML', ...menuKeyboard() });
+});
+
+bot.hears(MENU.flat(), async (ctx) => {
+  const label = ctx.message.text;
+  const session = getSession(ctx.from.id);
+  const modes = { '📖 Preview Text': 'preview', '✨ Beautify Text (AI)': 'beautify', '🛠 Validate Formatting': 'validate', '🔍 Fix Formatting': 'fix', '🧠 Ask AI': 'ask' };
+  if (modes[label]) {
+    session.mode = modes[label];
+    return ctx.reply(modePrompt(session.mode), menuKeyboard());
+  }
+  if (label === '📚 Formatting Guide') return ctx.reply('<b>Guide</b>\n• Rich Messages send <code>{html}</code> or <code>{markdown}</code>, never structural <code>blocks</code>.\n• HTML supports headings, lists, tables, quotes, details, media blocks, formulas, custom emoji, and inline styles.\n• Limits: 32768 UTF-8 chars, 500 blocks, 16 nesting levels, 50 media attachments, 20 table columns.', { parse_mode: 'HTML', ...menuKeyboard() });
+  if (label === '🆕 Rich Messages Examples') return ctx.reply('<pre>' + escapeHTML('# Release Notes\n\n<details open><summary>Highlights</summary>\n- **Rich Markdown** with <u>HTML underline</u>\n- ||spoilers|| and ==marked text==\n</details>\n\n| Feature | Status |\n|:--|:--:|\n| Rich Messages | ✅ |') + '</pre>', { parse_mode: 'HTML', ...menuKeyboard() });
+  if (label === '⚙️ Settings') return ctx.reply(settingsText(session), { parse_mode: 'HTML', ...menuKeyboard() });
+  return ctx.reply(helpText(Boolean(DEFAULT_GEMINI_API_KEY), Boolean(isOwner(ctx) && session.geminiApiKey), Boolean(BOT_OWNER_ID)), { parse_mode: 'HTML', ...menuKeyboard() });
 });
 
 bot.on('message', async (ctx) => {
-  if (!ctx.message || !ctx.message.text) return;
-  if (ctx.message.text.startsWith('/')) return;
-
-  const rawInput = ctx.message.text.trim();
-
-  // Route 1: JSON -> sendRichMessage
-  if (rawInput.startsWith('{') && rawInput.endsWith('}')) {
-    try {
-      const parsedPayload = JSON.parse(rawInput);
-
-      // prefer an object with `blocks`
-      const richMessage = parsedPayload.blocks ? parsedPayload : (Array.isArray(parsedPayload) ? { blocks: parsedPayload } : { blocks: [parsedPayload] });
-
-      // quick structural check
-      if (!richMessage.blocks || !Array.isArray(richMessage.blocks) || richMessage.blocks.length === 0) {
-        throw new Error('rich_message.blocks must be a non-empty array.');
-      }
-
-      await safeSendRichMessage(ctx, richMessage);
-      return;
-    } catch (err) {
-      console.error('sendRichMessage error to user:', err && err.telegram ? err.telegram : err.message || err);
-      await ctx.reply(
-        `❌ <b>sendRichMessage Failed</b>\n\n` +
-        `🚨 <b>Error:</b> <code>${escapeHTML(err && err.telegram && err.telegram.description ? err.telegram.description : (err.message || String(err)))}</code>\n\n` +
-        `💡 <i>Tip:</i> Ensure your JSON matches the InputRichMessage schema (top-level object with a \"blocks\" array). Example: ${escapeHTML(JSON.stringify(SAMPLE_RICH_MESSAGE))}`,
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-  }
-
-  // Route 2: HTML path
-  if (rawInput.includes('<') && rawInput.includes('>')) {
-    const validation = validateTelegramHTML(rawInput);
-    if (!validation.ok) {
-      await ctx.reply(
-        `❌ <b>HTML Validation Failed</b>\n\n` +
-        `🚨 <b>Issue:</b> <code>${escapeHTML(validation.error)}</code>\n\n` +
-        `💡 <i>Tip:</i> Allowed tags: <code>${ALLOWED_HTML_TAGS.join(', ')}</code>.`,
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-
-    try {
-      await ctx.reply(`✨ <b>HTML Rendering Result:</b>\n\n${rawInput}`, { parse_mode: 'HTML' });
-      return;
-    } catch (htmlError) {
-      console.error('HTML rendering error:', htmlError);
-      await ctx.reply(
-        `❌ <b>HTML Parse Failure</b>\n\n` +
-        `🚨 <b>Error:</b> <code>${escapeHTML(htmlError.message || String(htmlError))}</code>\n\n` +
-        `💡 <i>Tip:</i> Check allowed inline tags and ensure all attributes (like href on <a>) are valid URLs.`,
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-  }
-
-  // Route 3: Markdown
+  if (!ctx.message?.text || ctx.message.text.startsWith('/')) return;
+  const session = getSession(ctx.from.id);
+  const input = ctx.message.text.trim();
   try {
-    const mdValidation = validateSimpleMarkdown(rawInput);
-    if (!mdValidation.ok) {
-      await ctx.reply(
-        `❌ <b>Markdown Validation Failed</b>\n\n` +
-        `🚨 <b>Issue:</b> <code>${escapeHTML(mdValidation.error)}</code>\n\n` +
-        `💡 <i>Tip:</i> Use escaping (backslashes) to show raw symbols or ensure pairs are balanced.`,
-        { parse_mode: 'HTML' }
-      );
-      return;
+    if (session.mode === 'validate') return replyValidation(ctx, input);
+    if (session.mode === 'fix') return replyValidation(ctx, input, true);
+    if (session.mode === 'beautify') {
+      const html = await callGemini('Beautify this plain text into valid Telegram Rich HTML. Return only the Rich HTML.', input, getGeminiApiKey(ctx));
+      const repaired = repairHTML(html.replace(/^```(?:html)?\s*|```$/g, '').trim());
+      const validation = validateRichMessageInput(repaired);
+      if (!validation.ok) return replyValidation(ctx, repaired, true);
+      await sendRichMessage(ctx, { html: repaired });
+      return ctx.reply(`<b>Generated Rich HTML</b>\n<pre>${escapeHTML(truncate(repaired))}</pre>`, { parse_mode: 'HTML' });
     }
-
-    // prefer MarkdownV2 if you expect many special characters (adjust if you want plain Markdown)
-    await ctx.reply(`✨ *Markdown Rendering Result*:\n\n${rawInput}`, { parse_mode: 'Markdown' });
-  } catch (markdownError) {
-    console.error('Markdown render error:', markdownError);
-    await ctx.reply(
-      `❌ <b>Markdown Parse Failure</b>\n\n` +
-      `🚨 <b>Error:</b> <code>${escapeHTML(markdownError.message || String(markdownError))}</code>`,
-      { parse_mode: 'HTML' }
-    );
+    if (session.mode === 'ask') {
+      const answer = await callGemini('Answer this Telegram formatting question concisely and accurately. If giving examples, use valid Rich HTML.', input, getGeminiApiKey(ctx));
+      return ctx.reply(escapeHTML(truncate(answer)), { parse_mode: 'HTML' });
+    }
+    return preview(ctx, input);
+  } catch (error) {
+    console.error('Handler error:', error);
+    await ctx.reply(`❌ <b>Error</b>\n<code>${escapeHTML(error.message || String(error))}</code>`, { parse_mode: 'HTML' });
   }
 });
 
 bot.catch((err) => console.error('Unhandled bot error:', err));
 
-const PORT = process.env.PORT || 3000;
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end(`<html><body><h1>Formatting Blueprint Hub</h1></body></html>`);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(`<!doctype html><html><head><title>From Dev to Dev</title><style>body{font-family:system-ui;max-width:860px;margin:3rem auto;line-height:1.5}code,pre{background:#f4f4f5;padding:.15rem .35rem;border-radius:.35rem}pre{padding:1rem;overflow:auto}</style></head><body><h1>From Dev to Dev</h1><p>Telegram Rich Messages preview, validation, repair, and AI formatting assistant.</p><pre>{"html":"&lt;h1&gt;Hello&lt;/h1&gt;&lt;p&gt;Valid Rich HTML&lt;/p&gt;"}</pre></body></html>`);
 });
 
 server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+bot.launch().then(() => console.log('Bot launched')).catch((err) => console.error('Failed to launch bot:', err));
 
-bot.launch()
-  .then(() => console.log('Bot launched'))
-  .catch((err) => console.error('Failed to launch bot:', err));
-
-process.once('SIGINT', () => { bot.stop('SIGINT'); server.close(); });
-process.once('SIGTERM', () => { bot.stop('SIGTERM'); server.close(); });
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
